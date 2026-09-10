@@ -1,8 +1,7 @@
 #
-# laptop-configuration.nix
+# laptop-configuration.nix  (Design A: split encryption roots)
 #
-# A NixOS module that turns your laptop into one half of an automated
-# NAS backup setup. Import this from your existing configuration.nix:
+# Import this from your existing /etc/nixos/configuration.nix:
 #
 #   imports = [
 #     ./hardware-configuration.nix
@@ -10,22 +9,22 @@
 #   ];
 #
 # Before deploying:
-#   - Run laptop-setup.sh once to generate the SSH key and encryption-
-#     key file referenced below.
+#   - Run laptop-setup.sh once (generates ~/.ssh/id_ed25519 and
+#     ~/.config/nas-key).
 #   - Replace every YOUR_USERNAME with your real username.
-#   - Replace every YOUR_NAS_IP with your NAS's static LAN IP
-#     (or with "nas.local" if you've set up Avahi/mDNS).
+#   - Replace every YOUR_NAS_IP with the NAS's static LAN IP.
 #
-# What this module does:
-#   03:00  rsync home directory to NAS
+# Encryption model on the NAS (two independent encryption roots, one key):
+#   tank/gitea-enc    unlocked at 04:05, stays up all day
+#   tank/backups-enc  locked ~23.9h/day; this module unlocks it for the
+#                     duration of the 03:00 rsync, then re-locks it
+#
+# Nightly schedule:
+#   03:00  unlock backups-enc -> rsync home -> re-lock backups-enc
 #   03:30  nixos-rebuild switch from updated channel
 #   03:45  nix-collect-garbage
 #   03:50  nix-store --optimise
-#   04:05  send unlock command to NAS (so gitea comes back after its
-#          04:00 reboot)
-#
-# This module deliberately does NOT reboot the laptop. If you want it
-# to reboot nightly too, uncomment the nightly-reboot block at the end.
+#   04:05  unlock gitea-enc on the NAS (it rebooted at 04:00)
 #
 
 { config, pkgs, ... }:
@@ -33,20 +32,54 @@
 {
   services.openssh.enable = true;
 
-  # ---- 03:00 backup home dir to NAS ----
+  # Manual helper: after any unscheduled NAS reboot, run `unlock-nas`
+  # to bring gitea back up. (Backups stay sealed; the 03:00 bracket
+  # opens them only while syncing.)
+  environment.systemPackages = [
+    (pkgs.writeShellScriptBin "unlock-nas" ''
+      set -e
+      KEY_FILE="$HOME/.config/nas-key"
+      if [ ! -f "$KEY_FILE" ]; then
+        echo "Key file not found at $KEY_FILE — run laptop-setup.sh first." >&2
+        exit 1
+      fi
+      ${pkgs.openssh}/bin/ssh root@YOUR_NAS_IP \
+        'zfs load-key tank/gitea-enc 2>/dev/null; zfs mount tank/gitea-enc; systemctl --no-block restart gitea' \
+        < "$KEY_FILE"
+      echo "gitea unlocked."
+    '')
+  ];
+
+  # ---- 03:00 bracketed backup: unlock -> rsync -> re-lock ----
   systemd.services.nas-backup = {
-    description = "rsync home directory to NAS";
+    description = "rsync home directory to NAS (bracketed unlock)";
     serviceConfig = {
       Type = "oneshot";
       User = "YOUR_USERNAME";
     };
     path = [ pkgs.rsync pkgs.openssh ];
     script = ''
+      KEY_FILE="/home/YOUR_USERNAME/.config/nas-key"
+
+      # Unlock and mount the backups encryption root. If any step fails,
+      # abort loudly — rsync against an unmounted path would just error
+      # against the empty stub directory (the backup user can't write
+      # there), but there's no reason to even try.
+      if ! ssh root@YOUR_NAS_IP \
+          'zfs load-key tank/backups-enc 2>/dev/null; zfs mount tank/backups-enc; zfs mount tank/backups-enc/laptop; mountpoint -q /tank/backups/laptop' \
+          < "$KEY_FILE"; then
+        echo "Failed to unlock/mount backups dataset on NAS; aborting." >&2
+        exit 1
+      fi
+
+      rc=0
       rsync -aAXH --delete \
         --exclude='.cache' \
         --exclude='.local/share/Trash' \
         --exclude='.local/share/docker' \
         --exclude='.local/share/containers' \
+        --exclude='.steam' \
+        --exclude='.local/share/Steam' \
         --exclude='node_modules' \
         --exclude='.npm' \
         --exclude='.cargo/registry' \
@@ -55,7 +88,15 @@
         --exclude='.m2/repository' \
         -e "ssh -i /home/YOUR_USERNAME/.ssh/id_ed25519 -o StrictHostKeyChecking=accept-new" \
         /home/YOUR_USERNAME/ \
-        backup@YOUR_NAS_IP:/tank/backups/laptop/
+        backup@YOUR_NAS_IP:/tank/backups/laptop/ || rc=$?
+
+      # Re-lock no matter what happened above. Sanoid snapshots still
+      # run against the locked dataset (snapshotting is a metadata
+      # operation and works while sealed).
+      ssh root@YOUR_NAS_IP \
+        'zfs unmount tank/backups-enc/laptop; zfs unmount tank/backups-enc; zfs unload-key tank/backups-enc'
+
+      exit $rc
     '';
   };
   systemd.timers.nas-backup = {
@@ -86,13 +127,11 @@
     dates = [ "03:50" ];
   };
 
-  # ---- 04:05 send unlock command to NAS ----
-  # The NAS reboots at 04:00 and comes up with the ZFS pool locked.
-  # This service waits for the NAS to be reachable, then SSHes in as
-  # root and pipes the encryption key to `zfs load-key`, mounts the
-  # datasets, and restarts gitea.
+  # ---- 04:05 unlock gitea on the NAS after its 04:00 reboot ----
+  # Only gitea-enc. The backups root stays sealed until tomorrow's
+  # 03:00 bracket.
   systemd.services.unlock-nas = {
-    description = "Unlock the NAS encrypted pool";
+    description = "Unlock the NAS gitea dataset after nightly reboot";
     serviceConfig = {
       Type = "oneshot";
       User = "YOUR_USERNAME";
@@ -108,7 +147,7 @@
         sleep 10
       done
       ssh root@YOUR_NAS_IP \
-        'zfs load-key tank/encrypted && zfs mount -a && systemctl --no-block restart gitea' \
+        'zfs load-key tank/gitea-enc && zfs mount tank/gitea-enc && systemctl --no-block restart gitea' \
         < /home/YOUR_USERNAME/.config/nas-key
     '';
   };
@@ -121,25 +160,22 @@
   };
 
   # ---- Lid behavior ----
-  # Don't suspend on lid close when plugged in — just lock the screen.
-  # The backup, rebuild, and unlock all run while you're away from the
-  # laptop, so it must stay awake at night. Plug in before bed.
+  # The nightly jobs run while you're away, so the laptop must stay
+  # awake when plugged in. Plug in before bed.
   services.logind = {
-    lidSwitch = "suspend";                  # on battery: suspend (default)
-    lidSwitchExternalPower = "lock";        # plugged in: lock only
-    lidSwitchDocked = "ignore";             # docked: stay on
+    lidSwitch = "suspend";              # on battery: suspend
+    lidSwitchExternalPower = "lock";    # plugged in: lock only
+    lidSwitchDocked = "ignore";         # docked: stay on
   };
 
   # ---- Optional: nightly reboot ----
-  # Uncomment to reboot the laptop at 04:00 too. Useful if your kernel/
-  # initrd updates frequently and you want to apply them automatically.
-  # Note that nightly reboots cause Persistent=true timers to run again
-  # on next boot if they were missed — usually fine, but means a missed
-  # 03:00 backup could fire moments after you sit down in the morning.
+  # Uncomment to reboot the laptop at 04:15 (after the unlock has
+  # fired). Catches config bugs on a schedule you control and applies
+  # kernel updates promptly.
   #
   # systemd.timers.nightly-reboot = {
   #   wantedBy = [ "timers.target" ];
-  #   timerConfig.OnCalendar = "*-*-* 04:00:00";
+  #   timerConfig.OnCalendar = "*-*-* 04:15:00";
   # };
   # systemd.services.nightly-reboot = {
   #   serviceConfig.Type = "oneshot";
