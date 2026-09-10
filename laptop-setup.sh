@@ -3,12 +3,12 @@
 # laptop-setup.sh — run once on the laptop, as your normal user.
 #
 # Generates two things:
-#   1. An SSH keypair at ~/.ssh/id_ed25519, used to authenticate to
-#      the NAS as the backup user and as root (for unlocking).
+#   1. An SSH keypair at ~/.ssh/id_ed25519, used to authenticate to the
+#      NAS as the backup user (nightly rsync) and as root (unlock).
 #   2. The NAS encryption-key file at ~/.config/nas-key, derived as
-#      sha256(passphrase). The passphrase itself is never stored, so
-#      if this laptop is destroyed you can reconstruct the key from
-#      memory using nas-recover.sh.
+#      sha256(passphrase). The passphrase itself is never stored, so if
+#      this laptop is destroyed you can reconstruct the key from memory
+#      using recover.sh on a fresh install.
 #
 
 set -euo pipefail
@@ -41,9 +41,9 @@ cat <<'EOF'
 Choose a passphrase for the NAS encryption.
 
 IMPORTANT: write it down somewhere safe (paper in a fireproof box, a
-password manager that syncs off this laptop, a steel plate in a safe,
-etc). If you forget the passphrase AND lose this laptop, the NAS data
-is unrecoverable. ZFS encryption has no backdoor.
+password manager that syncs off this laptop, a steel plate in a safe).
+If you forget the passphrase AND lose this laptop, the NAS data is
+unrecoverable. ZFS encryption has no backdoor.
 
 EOF
 
@@ -85,19 +85,25 @@ Done.
 
 1. Encryption key written to: $KEY_FILE
 
-2. Paste this SSH public key into nas-configuration.nix, in all three
-   places marked LAPTOP_SSH_PUBKEY:
+2. Paste this SSH public key into nas-configuration.nix, in all
+   three places marked LAPTOP_SSH_PUBKEY:
 
 EOF
 cat "${SSH_KEY}.pub"
 cat <<EOF
 
-3. After deploying nas-configuration.nix on the NAS, copy this script
-   and the key file over and run nas-setup.sh as root:
+3. Deploy nas-configuration.nix on the NAS (nixos-rebuild switch),
+   then create the pool from this laptop:
 
+     ssh YOUR_USERNAME@YOUR_NAS_IP 'ls -l /dev/disk/by-id/' | grep -v part
      scp $KEY_FILE nas-setup.sh YOUR_USERNAME@YOUR_NAS_IP:/tmp/
-     ssh YOUR_USERNAME@YOUR_NAS_IP 'sudo bash /tmp/nas-setup.sh /tmp/nas-key'
+     ssh YOUR_USERNAME@YOUR_NAS_IP \\
+       'sudo bash /tmp/nas-setup.sh /tmp/nas-key \\
+         /dev/disk/by-id/ata-DISK1 /dev/disk/by-id/ata-DISK2'
      ssh YOUR_USERNAME@YOUR_NAS_IP 'shred -u /tmp/nas-key /tmp/nas-setup.sh'
+
+4. Fill in laptop-configuration.nix (username, NAS IP), import it
+   from your /etc/nixos/configuration.nix, and rebuild.
 
 ================================================================
 EOF
