@@ -2,48 +2,39 @@
 #
 # nas-setup.sh — run once on the NAS, as root.
 #
-# Run AFTER:
-#   - laptop-setup.sh has produced an encryption key on the laptop
-#   - nas-configuration.nix has been deployed on the NAS (which creates
-#     the 'backup' user this script chowns to)
+# Run AFTER nas-configuration.nix has been deployed (it creates the
+# 'backup' user this script chowns to; gitea failing to start until
+# this script finishes is expected).
 #
 # Usage:
 #
 #   sudo ./nas-setup.sh KEYFILE DISK1 DISK2
-#       Fully non-interactive except for the final YES confirmation.
-#       This is the recommended invocation.
+#       Fully non-interactive except the final YES confirmation.
 #
 #   sudo ./nas-setup.sh KEYFILE
-#       Prompts interactively for the two disk paths.
+#       Prompts for the two disk paths.
 #
-#   sudo ./nas-setup.sh
-#       Prompts for everything (you'll need to paste the 64-char key).
-#       Annoying without copy-paste; prefer one of the above.
+# Recommended workflow from the laptop (all copy-paste happens in your
+# laptop's terminal; the NAS needs no console or GUI):
 #
-# Recommended workflow from the laptop (no console access to the NAS
-# needed; all copy-paste happens in your laptop's terminal):
-#
-#   # 1. Look at available disks
 #   ssh YOUR_USERNAME@YOUR_NAS_IP 'ls -l /dev/disk/by-id/' | grep -v part
-#
-#   # 2. Copy key and script over
 #   scp ~/.config/nas-key nas-setup.sh YOUR_USERNAME@YOUR_NAS_IP:/tmp/
-#
-#   # 3. Run setup with paths copy-pasted from step 1's output
 #   ssh YOUR_USERNAME@YOUR_NAS_IP \
 #     'sudo bash /tmp/nas-setup.sh /tmp/nas-key \
 #       /dev/disk/by-id/ata-... /dev/disk/by-id/ata-...'
-#
-#   # 4. Clean up
 #   ssh YOUR_USERNAME@YOUR_NAS_IP 'shred -u /tmp/nas-key /tmp/nas-setup.sh'
 #
-# Creates:
-#   tank                       (mirror, mountpoint=none)
-#   tank/encrypted             (aes-256-gcm, mountpoint=/tank, key from
-#                               sha256 of your laptop passphrase)
-#   tank/encrypted/gitea       -> mounted at /tank/gitea
-#   tank/encrypted/backups     -> mounted at /tank/backups
-#   tank/encrypted/backups/laptop -> mounted at /tank/backups/laptop
+# Creates (Design A: two independent encryption roots, one shared key):
+#
+#   tank                        (mirror, mountpoint=none)
+#   tank/gitea-enc              encryption root -> /tank/gitea
+#   tank/backups-enc            encryption root -> /tank/backups
+#   tank/backups-enc/laptop     child            -> /tank/backups/laptop
+#
+# gitea-enc and backups-enc lock/unlock independently: gitea stays
+# unlocked all day, backups are unlocked only during the 03:00 sync.
+# Both use the same key (sha256 of your passphrase), so recovery needs
+# only the one passphrase.
 #
 
 set -euo pipefail
@@ -63,33 +54,25 @@ KEYFILE="${1:-}"
 DISK1="${2:-}"
 DISK2="${3:-}"
 
-# ---- Read the key ----
-# Priority: $1 (file path) > stdin (if not a tty) > prompt
-if [ -n "$KEYFILE" ]; then
-  if [ ! -f "$KEYFILE" ]; then
-    echo "Key file not found: $KEYFILE" >&2
-    exit 1
-  fi
-  KEY="$(cat "$KEYFILE")"
-elif [ ! -t 0 ]; then
-  KEY="$(cat)"
-else
-  echo "Paste the 64-character hex key (contents of laptop's ~/.config/nas-key):"
-  read -rp "Key: " KEY
-fi
-
-# Strip any whitespace/newlines so e.g. an editor-added trailing newline
-# doesn't break the 64-char check.
-KEY="${KEY//[$'\t\r\n ']/}"
-
-if [ "${#KEY}" -ne 64 ]; then
-  echo "Expected 64 hex characters, got ${#KEY}. Aborting." >&2
-  unset KEY
+if [ -z "$KEYFILE" ] || [ ! -f "$KEYFILE" ]; then
+  echo "Usage: $0 KEYFILE [DISK1 DISK2]" >&2
+  echo "KEYFILE is the 64-char hex file produced by laptop-setup.sh" >&2
   exit 1
 fi
+KEYFILE="$(realpath "$KEYFILE")"
+
+# Validate key contents (strip whitespace for the check only; the file
+# itself is used as-is by ZFS, so it must already be clean).
+KEYCHECK="$(tr -d '[:space:]' < "$KEYFILE")"
+if [ "${#KEYCHECK}" -ne 64 ]; then
+  echo "Key file should contain exactly 64 hex characters, found ${#KEYCHECK}." >&2
+  echo "Regenerate with laptop-setup.sh (it writes the file without a newline)." >&2
+  unset KEYCHECK
+  exit 1
+fi
+unset KEYCHECK
 
 # ---- Pick disks ----
-# Skip interactive prompts if both were passed as args.
 if [ -z "$DISK1" ] || [ -z "$DISK2" ]; then
   echo
   echo "Available disks (use the by-id path so the pool survives controller"
@@ -99,14 +82,13 @@ if [ -z "$DISK1" ] || [ -z "$DISK2" ]; then
     | grep -E 'ata-|nvme-|scsi-' \
     | grep -v -- '-part' \
     || echo "(none found — is /dev/disk/by-id/ populated?)"
-
   echo
-  [ -z "$DISK1" ] && read -rp "First data disk  (full path, e.g. /dev/disk/by-id/ata-...): " DISK1
-  [ -z "$DISK2" ] && read -rp "Second data disk (full path):                                " DISK2
+  [ -z "$DISK1" ] && read -rp "First data disk  (full path): " DISK1
+  [ -z "$DISK2" ] && read -rp "Second data disk (full path): " DISK2
 fi
 
-[ -e "$DISK1" ] || { echo "Not found: $DISK1" >&2; unset KEY; exit 1; }
-[ -e "$DISK2" ] || { echo "Not found: $DISK2" >&2; unset KEY; exit 1; }
+[ -e "$DISK1" ] || { echo "Not found: $DISK1" >&2; exit 1; }
+[ -e "$DISK2" ] || { echo "Not found: $DISK2" >&2; exit 1; }
 
 echo
 echo "About to ERASE and create a ZFS mirror on:"
@@ -116,7 +98,6 @@ echo
 read -rp "Type 'YES' to continue: " CONFIRM
 if [ "$CONFIRM" != "YES" ]; then
   echo "Aborted."
-  unset KEY
   exit 1
 fi
 
@@ -130,27 +111,35 @@ zpool create -f \
   -m none \
   tank mirror "$DISK1" "$DISK2"
 
-# ---- Encrypted parent dataset ----
-# Mountpoint=/tank means children inherit mountpoints under /tank,
-# stripping the parent's dataset name. So tank/encrypted/gitea is
-# mounted at /tank/gitea (not /tank/encrypted/gitea).
-printf '%s' "$KEY" | zfs create \
+# ---- Encryption root #1: gitea ----
+# Explicit mountpoints everywhere: the dataset name and the filesystem
+# path should correspond visibly (a hard-won lesson).
+zfs create \
   -o encryption=aes-256-gcm \
   -o keyformat=hex \
-  -o keylocation=prompt \
-  -o mountpoint=/tank \
-  tank/encrypted
-unset KEY
+  -o keylocation="file://$KEYFILE" \
+  -o mountpoint=/tank/gitea \
+  tank/gitea-enc
 
-# ---- Children ----
-zfs create tank/encrypted/gitea
-zfs create tank/encrypted/backups
-zfs create tank/encrypted/backups/laptop
+# ---- Encryption root #2: backups ----
+zfs create \
+  -o encryption=aes-256-gcm \
+  -o keyformat=hex \
+  -o keylocation="file://$KEYFILE" \
+  -o mountpoint=/tank/backups \
+  tank/backups-enc
+
+zfs create \
+  -o mountpoint=/tank/backups/laptop \
+  tank/backups-enc/laptop
+
+# ---- Switch key sources to prompt (stdin) ----
+# From now on, keys are piped over SSH from the laptop; nothing on the
+# NAS can unlock the pool by itself.
+zfs set keylocation=prompt tank/gitea-enc
+zfs set keylocation=prompt tank/backups-enc
 
 # ---- Permissions ----
-# The 'backup' user owns its drop folder so the laptop can rsync into
-# it. The dataset name is tank/encrypted/backups/laptop but it mounts
-# at /tank/backups/laptop (see comment on tank/encrypted above).
 if id backup &>/dev/null; then
   chown backup:users /tank/backups/laptop
 else
@@ -162,16 +151,21 @@ fi
 
 echo
 echo "Done. Pool layout:"
-zfs list -o name,encryption,mountpoint,used,available
+zfs list -o name,encryption,keystatus,mountpoint,used,available
 
 cat <<'EOF'
 
-The pool is currently unlocked. After any reboot it will be locked
-again. The laptop's unlock-nas service handles this automatically at
-04:05; for manual unlock during setup, from the laptop:
+Both encryption roots are currently unlocked. After any reboot they
+are locked again. Normal operation:
 
-  ssh root@YOUR_NAS_IP \
-    'zfs load-key tank/encrypted && zfs mount -a && systemctl restart gitea' \
-    < ~/.config/nas-key
+  - gitea-enc:   unlocked by the laptop's unlock-nas timer at 04:05
+                 (or manually: run `unlock-nas` on the laptop)
+  - backups-enc: unlocked only during the 03:00 backup bracket
+
+Now on the NAS: systemctl restart gitea
+(it was failing until this pool existed; it should start cleanly now).
+
+Finally, shred the key file you copied here:
+  shred -u /tmp/nas-key
 
 EOF
