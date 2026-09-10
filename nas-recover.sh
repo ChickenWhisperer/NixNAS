@@ -1,183 +1,203 @@
 #!/usr/bin/env bash
 #
-# nas-recover.sh
+# recover.sh — full recovery onto a FRESH NixOS install.
 #
-# Walks you through unlocking the NAS encrypted pool and copying data
-# off it, in the scenario where the laptop is dead/lost and you only
-# have your memorized passphrase.
+# Scenario: your laptop is dead/lost. You have a new machine with a
+# fresh NixOS install, on the same LAN as the (still working) NAS, and
+# you remember your passphrase. This script:
 #
-# Run this on any Linux machine with ZFS userland tools available:
-#   - On the NAS itself if the NAS is still functional
-#   - On a NixOS live ISO if you've moved the disks elsewhere
-#     (nix-shell -p zfs to get the tools)
-#   - On any distro with `zfsutils-linux` installed
+#   1. Re-derives the encryption key from your passphrase
+#   2. Generates a new SSH key on this machine
+#   3. Unlocks both encryption roots on the NAS (you authenticate with
+#      your NAS account password — this is why the NAS config keeps
+#      PasswordAuthentication enabled)
+#   4. Authorizes the new SSH key for the backup user
+#   5. Pulls your entire backed-up home directory onto this machine
+#   6. Re-locks the backups dataset and restores the nightly setup
 #
-# How the original encryption was set up:
-#   - You chose a passphrase and memorized it.
-#   - The actual ZFS key is sha256(passphrase), 64 hex characters.
-#   - The laptop kept the hex on disk so daily unlocks were automatic.
-#   - This script regenerates the hex from the passphrase you remember.
+# Requirements on this machine: ssh, scp, rsync, sha256sum.
+# On a minimal NixOS install:  nix-shell -p openssh rsync coreutils
 #
-# KEEP A COPY OF THIS SCRIPT OFF THE LAPTOP. A USB stick, a printout,
-# an email to yourself — anywhere you can reach if the laptop is dead.
+# KEEP A COPY OF THIS SCRIPT OFF YOUR LAPTOP: USB stick, printout,
+# email to yourself. It can't help you if it only lives on the dead
+# machine. (Your passphrase, written down separately, is the other
+# half of the recovery story.)
+#
+# ----------------------------------------------------------------
+# If the NAS ITSELF is dead: move the two data disks into any Linux
+# machine with ZFS tools and run, as root:
+#
+#   zpool import -f tank
+#   read -rs PASS; KEY=$(printf '%s' "$PASS" | sha256sum | awk '{print $1}')
+#   printf '%s' "$KEY" | zfs load-key tank/gitea-enc
+#   printf '%s' "$KEY" | zfs load-key tank/backups-enc
+#   zfs mount -a
+#
+# Your data is then at /tank/backups/laptop and /tank/gitea.
+# ----------------------------------------------------------------
 #
 
 set -euo pipefail
 
-cat <<'EOF'
-================================================================
-NAS Recovery
-================================================================
-
-This script will:
-  1. Re-derive the encryption key from your memorized passphrase
-  2. Help you unlock the ZFS pool ("tank")
-  3. Mount the encrypted datasets
-  4. Print useful next-step commands
-
-You can quit at any time with Ctrl-C; nothing destructive happens
-without an explicit "YES" confirmation.
-
-EOF
-
-# ---- Sanity: do we have the tools? ----
-for cmd in zpool zfs sha256sum; do
+# ---- Tool check ----
+for cmd in ssh scp rsync sha256sum ssh-keygen; do
   if ! command -v "$cmd" >/dev/null 2>&1; then
     echo "Missing required command: $cmd" >&2
-    echo "On NixOS live ISO, run: nix-shell -p zfs" >&2
-    echo "On Debian/Ubuntu: apt install zfsutils-linux coreutils" >&2
+    echo "On NixOS: nix-shell -p openssh rsync coreutils" >&2
     exit 1
   fi
 done
 
-# ---- Step 1: Find or import the pool ----
-echo "Step 1: Locate the pool"
-echo "-----------------------"
-echo
-
-if zpool list tank &>/dev/null; then
-  echo "Pool 'tank' is already imported on this machine."
-else
-  echo "Scanning for importable pools..."
-  echo
-  zpool import || true
-  echo
-  cat <<'EOF'
-If you saw a pool named 'tank' above, we'll import it now.
-
-If you're running this on a NEW machine (the NAS died, you moved the
-disks elsewhere), you'll need -f to force the import because the pool
-remembers it belonged to a different machine. This is expected and
-safe — there's no other machine currently using these disks.
-
-EOF
-  read -rp "Import 'tank' now? [y/N] " yn
-  if [ "$yn" != "y" ] && [ "$yn" != "Y" ]; then
-    echo "Aborted. You can import manually later with: zpool import -f tank"
-    exit 0
-  fi
-  sudo zpool import -f tank
-  echo "Pool imported."
-fi
-echo
-
-# ---- Step 2: Re-derive the key from passphrase ----
-echo "Step 2: Re-derive the encryption key"
-echo "-------------------------------------"
-echo
 cat <<'EOF'
-Type your memorized passphrase below. It will not be echoed.
+================================================================
+NAS Recovery — fresh machine, working NAS
+================================================================
 
-IMPORTANT: it must match EXACTLY — same capitalization, same spaces,
-same punctuation. The key is computed as:
-
-    sha256(passphrase)  (with no trailing newline)
-
-If you typo it, the unlock will fail; just run this script again.
+You will be asked for:
+  - The NAS's IP address
+  - Your admin username on the NAS
+  - Your NAS account password (a few times, for SSH + sudo)
+  - Your memorized encryption passphrase (once)
 
 EOF
 
+read -rp "NAS IP address: " NAS_IP
+read -rp "Your admin username on the NAS: " NAS_USER
+
+# Reuse one SSH connection for all admin-user operations so you only
+# type the account password once.
+CTRL_DIR="$(mktemp -d)"
+SSH_OPTS=(-o ControlMaster=auto -o "ControlPath=$CTRL_DIR/cm" -o ControlPersist=10m -o StrictHostKeyChecking=accept-new)
+trap 'ssh -O exit -o "ControlPath=$CTRL_DIR/cm" "$NAS_USER@$NAS_IP" 2>/dev/null; rm -rf "$CTRL_DIR"' EXIT
+
+# ---- Step 1: derive the key ----
+cat <<'EOF'
+
+Type your memorized passphrase. It must match EXACTLY — same
+capitalization, spaces, punctuation. If the unlock fails later,
+just re-run this script and try again.
+
+EOF
 read -rsp "Passphrase: " PASS; echo
 KEY="$(printf '%s' "$PASS" | sha256sum | awk '{print $1}')"
 unset PASS
 
 if [ "${#KEY}" -ne 64 ]; then
-  echo "Internal error: key isn't 64 chars (got ${#KEY}). Aborting." >&2
+  echo "Internal error: derived key isn't 64 chars. Aborting." >&2
   unset KEY
   exit 1
 fi
 
-echo "Key derived (64 hex characters). Not displayed for safety."
+# ---- Step 2: new SSH key for this machine ----
+SSH_KEY="${HOME}/.ssh/id_ed25519"
+if [ ! -f "$SSH_KEY" ]; then
+  echo "Generating SSH key at $SSH_KEY"
+  mkdir -p "${HOME}/.ssh"; chmod 700 "${HOME}/.ssh"
+  ssh-keygen -t ed25519 -N "" -f "$SSH_KEY"
+fi
+
+# ---- Step 3+4: unlock the NAS and authorize this machine ----
+# The key and pubkey go to the NAS's /tmp, a root script consumes them
+# (you'll type your account password for SSH, then again for sudo),
+# and the key material is shredded on the NAS afterwards.
 echo
+echo "Copying key material to the NAS (enter your NAS account password)..."
+printf '%s' "$KEY" > "$CTRL_DIR/recover.key"
+unset KEY
+scp "${SSH_OPTS[@]}" -q "$CTRL_DIR/recover.key" "${SSH_KEY}.pub" \
+  "$NAS_USER@$NAS_IP:/tmp/" 
+rm -f "$CTRL_DIR/recover.key"
 
-# ---- Step 3: Load the key ----
-echo "Step 3: Unlock the dataset"
-echo "---------------------------"
-echo
+cat > "$CTRL_DIR/remote.sh" <<'REMOTE'
+set -euo pipefail
+mv /tmp/id_ed25519.pub /tmp/recover.pub 2>/dev/null || true
 
-KEYSTATUS="$(sudo zfs get -H -o value keystatus tank/encrypted 2>/dev/null || echo missing)"
+# Import the pool if this boot's import didn't happen
+if ! zpool list tank &>/dev/null; then
+  zpool import tank 2>/dev/null || zpool import -d /dev/disk/by-id tank
+fi
 
-if [ "$KEYSTATUS" = "available" ]; then
-  echo "Pool is already unlocked. Skipping key load."
-elif [ "$KEYSTATUS" = "missing" ]; then
-  cat >&2 <<'EOF'
+# Unlock both encryption roots (skip any already unlocked)
+for ds in tank/gitea-enc tank/backups-enc; do
+  if [ "$(zfs get -H -o value keystatus "$ds")" != "available" ]; then
+    zfs load-key -L file:///tmp/recover.key "$ds"
+  fi
+done
+zfs mount -a
+mountpoint -q /tank/backups/laptop || { echo "backups dataset failed to mount" >&2; exit 1; }
 
-Couldn't find dataset 'tank/encrypted'. Either the pool layout is
-different than expected, or the import didn't actually work.
+# Authorize the new machine's key for the backup user so rsync can
+# pull without a password (the backup account has no password).
+mkdir -p /tank/backups/.ssh
+cat /tmp/recover.pub >> /tank/backups/.ssh/authorized_keys
+chown -R backup:users /tank/backups/.ssh
+chmod 700 /tank/backups/.ssh
+chmod 600 /tank/backups/.ssh/authorized_keys
 
-Run `zfs list` to see what's actually there. The encrypted dataset
-might be named differently (e.g. 'tank/enc' or just 'tank').
+# Defensive: ensure gitea's expected state skeleton exists before restart.
+# On an existing pool it already does; this guards the edge case where it
+# doesn't. Safe here because `zfs mount -a` ran above, so /tank/gitea is a
+# real mountpoint, not a stub on the root filesystem.
+mkdir -p /tank/gitea/custom/conf
+chown gitea:gitea /tank/gitea /tank/gitea/custom /tank/gitea/custom/conf
+
+systemctl restart gitea || true
+shred -u /tmp/recover.key /tmp/recover.pub
+echo "NAS unlocked; new machine authorized."
+REMOTE
+scp "${SSH_OPTS[@]}" -q "$CTRL_DIR/remote.sh" "$NAS_USER@$NAS_IP:/tmp/remote.sh"
+
+echo "Unlocking the NAS (enter your password again if sudo asks)..."
+ssh "${SSH_OPTS[@]}" -t "$NAS_USER@$NAS_IP" 'sudo bash /tmp/remote.sh && rm -f /tmp/remote.sh'
+
+# ---- Step 5: pull everything back ----
+cat <<EOF
+
+Pulling your home directory from the NAS into $HOME
+(existing files with the same names will be overwritten; nothing is
+deleted). This includes your OLD SSH key, which the NAS config already
+trusts — so after this completes, the normal nightly setup works
+without touching the NAS config.
 
 EOF
-  unset KEY
-  exit 1
-else
-  printf '%s' "$KEY" | sudo zfs load-key tank/encrypted
-  echo "Key loaded successfully."
-fi
-unset KEY
-echo
+rsync -aAXH --info=progress2 \
+  -e "ssh -i $SSH_KEY -o StrictHostKeyChecking=accept-new" \
+  "backup@$NAS_IP:/tank/backups/laptop/" "$HOME"/
 
-# ---- Step 4: Mount everything ----
-echo "Step 4: Mount the datasets"
-echo "---------------------------"
-echo
-sudo zfs mount -a
-echo "Mounted. Current state:"
-echo
-zfs list -o name,mountpoint,used
-echo
-echo "Your data should now be accessible at /tank/ (or wherever the"
-echo "datasets are mounted, per the list above)."
-echo
+# ---- Step 6: restore nightly-setup state and re-lock backups ----
+# ~/.config/nas-key came back with the rsync (same passphrase → same
+# derived key), but write it explicitly in case the pull was partial.
+mkdir -p "$HOME/.config"
+# Re-derive rather than keep it in a variable this whole time:
+read -rsp "Passphrase once more (to write ~/.config/nas-key): " PASS; echo
+printf '%s' "$PASS" | sha256sum | awk '{printf "%s", $1}' > "$HOME/.config/nas-key"
+unset PASS
+chmod 600 "$HOME/.config/nas-key"
 
-# ---- Step 5: Next steps ----
-echo "Step 5: What to do next"
-echo "------------------------"
+echo
+echo "Re-locking the backups dataset (gitea stays up)..."
+ssh "${SSH_OPTS[@]}" -t "$NAS_USER@$NAS_IP" \
+  'sudo bash -c "zfs unmount tank/backups-enc/laptop; zfs unmount tank/backups-enc; zfs unload-key tank/backups-enc"'
+
 cat <<'EOF'
 
-If you're recovering on the NAS itself, restart gitea so it picks up
-the now-mounted state directory:
+================================================================
+Recovery complete.
 
-  sudo systemctl restart gitea
+  - Your home directory is restored.
+  - gitea is up; backups are re-sealed.
+  - Your old SSH key is back at ~/.ssh/id_ed25519 and is the one
+    the NAS's configuration.nix trusts declaratively.
 
-Common things you might want to do now:
+Remaining steps to make this machine the new "laptop":
 
-  # Copy your laptop home backup to an external drive:
-  rsync -aAXH --info=progress2 /tank/backups/laptop/ /mnt/external-drive/
+  1. Copy laptop-configuration.nix into /etc/nixos/, fill in your
+     username and the NAS IP, import it from configuration.nix,
+     and run: sudo nixos-rebuild switch
+  2. Verify the timers exist:
+       systemctl list-timers | grep -E 'nas-backup|unlock-nas'
+  3. Optionally run a manual backup to confirm the loop:
+       sudo systemctl start nas-backup
 
-  # Tar it up to a single archive (good for cold storage):
-  tar -czf /mnt/external-drive/laptop-backup.tar.gz -C /tank/backups laptop
-
-  # Pull a specific file:
-  cp /tank/backups/laptop/Documents/whatever.pdf ~/Desktop/
-
-  # See what's in the gitea repos (bare repos, use git clone to access):
-  ls /tank/gitea/repositories/
-
-  # Browse a previous snapshot (read-only):
-  ls /tank/backups/laptop/.zfs/snapshot/
-
-You're done with this script. The pool will stay unlocked until the
-machine reboots or you run `zfs unload-key tank/encrypted`.
+================================================================
 EOF
