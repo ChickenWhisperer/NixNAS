@@ -72,31 +72,37 @@
         exit 1
       fi
 
-      rc=0
-      rsync -aAXH --delete \
-        --exclude='.cache' \
-        --exclude='.local/share/Trash' \
-        --exclude='.local/share/docker' \
-        --exclude='.local/share/containers' \
-        --exclude='.steam' \
-        --exclude='.local/share/Steam' \
-        --exclude='node_modules' \
-        --exclude='.npm' \
-        --exclude='.cargo/registry' \
-        --exclude='.rustup' \
-        --exclude='.gradle/caches' \
-        --exclude='.m2/repository' \
-        -e "ssh -i /home/YOUR_USERNAME/.ssh/id_ed25519 -o StrictHostKeyChecking=accept-new" \
-        /home/YOUR_USERNAME/ \
-        backup@YOUR_NAS_IP:/tank/backups/laptop/ || rc=$?
+  rc=0
+  rsync -aAXH --delete \
+    --exclude='.cache' \
+    --exclude='.local/share/Trash' \
+    --exclude='.local/share/docker' \
+    --exclude='.local/share/containers' \
+    --exclude='.steam' \
+    --exclude='.local/share/Steam' \
+    --exclude='node_modules' \
+    --exclude='.npm' \
+    --exclude='.cargo/registry' \
+    --exclude='.rustup' \
+    --exclude='.gradle/caches' \
+    --exclude='.m2/repository' \
+    -e "ssh -i /home/YOUR_USERNAME/.ssh/id_ed25519 -o StrictHostKeyChecking=accept-new" \
+    /home/YOUR_USERNAME/ \
+    backup@YOUR_NAS_IP:/tank/backups/laptop/ || rc=$?
 
-      # Re-lock no matter what happened above. Sanoid snapshots still
-      # run against the locked dataset (snapshotting is a metadata
-      # operation and works while sealed).
-      ssh root@YOUR_NAS_IP \
-        'zfs unmount tank/backups-enc/laptop; zfs unmount tank/backups-enc; zfs unload-key tank/backups-enc'
+  # rsync exits with 23 if it couldn't read some files (e.g. root-owned
+  # files in your home dir from Docker/VMs) and 24 if files vanished
+  # during the sync. We treat these as successful partial backups.
+  if [ "$rc" -eq 23 ] || [ "$rc" -eq 24 ]; then
+    echo "rsync finished with warnings (code $rc), treating as success."
+    rc=0
+  fi
 
-      exit $rc
+  # Re-lock no matter what happened above.
+  ssh root@YOUR_NAS_IP \
+    'zfs unmount tank/backups-enc/laptop; zfs unmount tank/backups-enc; zfs unload-key tank/backups-enc'
+  exit $rc
+
     '';
   };
   systemd.timers.nas-backup = {
