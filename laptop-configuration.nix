@@ -72,6 +72,21 @@
         exit 1
       fi
 
+  # ---- Space-based pruning ----
+  # Ensure the pool never fills up completely, leaving room for gitea and the OS.
+  # If usage exceeds 85%, delete the oldest snapshot(s) until it drops below.
+  USAGE=$(ssh root@YOUR_NAS_IP "zpool list -H -o capacity tank" | tr -d '%')
+  while [ "$USAGE" -gt 85 ]; do
+    OLDEST=$(ssh root@YOUR_NAS_IP "zfs list -H -o name -t snapshot -r tank/backups-enc | head -n 1")
+    if [ -z "$OLDEST" ]; then
+      echo "No more snapshots to prune, but pool is still ${USAGE}% full." >&2
+      break
+    fi
+    echo "Pool is ${USAGE}% full. Pruning oldest snapshot: $OLDEST"
+    ssh root@YOUR_NAS_IP "zfs destroy '$OLDEST'"
+    USAGE=$(ssh root@YOUR_NAS_IP "zpool list -H -o capacity tank" | tr -d '%')
+  done
+
   rc=0
   rsync -aAXH --delete \
     --exclude='.cache' \
