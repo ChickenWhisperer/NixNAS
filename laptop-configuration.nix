@@ -79,10 +79,10 @@
   while [ "$USAGE" -gt 85 ]; do
     OLDEST=$(ssh root@YOUR_NAS_IP "zfs list -H -o name -t snapshot -r tank/backups-enc | head -n 1")
     if [ -z "$OLDEST" ]; then
-      echo "No more snapshots to prune, but pool is still ${USAGE}% full." >&2
+      echo "No more snapshots to prune, but pool is still $USAGE% full." >&2
       break
     fi
-    echo "Pool is ${USAGE}% full. Pruning oldest snapshot: $OLDEST"
+    echo "Pool is $USAGE% full. Pruning oldest snapshot: $OLDEST"
     ssh root@YOUR_NAS_IP "zfs destroy '$OLDEST'"
     USAGE=$(ssh root@YOUR_NAS_IP "zpool list -H -o capacity tank" | tr -d '%')
   done
